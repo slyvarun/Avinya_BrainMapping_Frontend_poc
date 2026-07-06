@@ -395,11 +395,7 @@ const VisualizerView = ({ selectedPatient, selectedFile, token, onBack }) => {
 
     // Sync uniform changes immediately
     useEffect(() => {
-        const res = resourcesRef.current;
-        if (res.phantomHeadShaderMaterial) {
-            res.phantomHeadShaderMaterial.uniforms.u_opacity.value = headmodelOpacity;
-            res.phantomHeadShaderMaterial.uniforms.u_heatmapOpacity.value = heatmapOpacity;
-        }
+        // Opacities now solid by default, u_opacity/u_heatmapOpacity removed
     }, [headmodelOpacity, heatmapOpacity]);
 
     const handlePlayPause = () => {
@@ -480,46 +476,126 @@ const VisualizerView = ({ selectedPatient, selectedFile, token, onBack }) => {
                 geometry.computeVertexNormals();
 
                 res.paintableMask = cfg.paintable_mask || new Array(res.vertexCount).fill(1);
-                geometry.setAttribute('a_interpolatedScalar', new THREE.BufferAttribute(new Float32Array(res.vertexCount), 1));
                 geometry.setAttribute('a_paintable', new THREE.BufferAttribute(new Float32Array(res.paintableMask), 1));
                 geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(res.vertexCount * 3), 3));
 
+                // Process Perrin Projection Weights for GPU Offloading
+                const V = res.vertexCount;
+                const w0 = new Float32Array(V * 4);
+                const w1 = new Float32Array(V * 4);
+                const w2 = new Float32Array(V * 4);
+                const w3 = new Float32Array(V * 4);
+                const w4 = new Float32Array(V * 3);
+
+                for (let j = 0; j < V; j++) {
+                    const row = cfg.projection_matrix[j];
+                    w0[j * 4 + 0] = row[0];
+                    w0[j * 4 + 1] = row[1];
+                    w0[j * 4 + 2] = row[2];
+                    w0[j * 4 + 3] = row[3];
+
+                    w1[j * 4 + 0] = row[4];
+                    w1[j * 4 + 1] = row[5];
+                    w1[j * 4 + 2] = row[6];
+                    w1[j * 4 + 3] = row[7];
+
+                    w2[j * 4 + 0] = row[8];
+                    w2[j * 4 + 1] = row[9];
+                    w2[j * 4 + 2] = row[10];
+                    w2[j * 4 + 3] = row[11];
+
+                    w3[j * 4 + 0] = row[12];
+                    w3[j * 4 + 1] = row[13];
+                    w3[j * 4 + 2] = row[14];
+                    w3[j * 4 + 3] = row[15];
+
+                    w4[j * 3 + 0] = row[16];
+                    w4[j * 3 + 1] = row[17];
+                    w4[j * 3 + 2] = row[18];
+                }
+
+                geometry.setAttribute('a_projWeight0', new THREE.BufferAttribute(w0, 4));
+                geometry.setAttribute('a_projWeight1', new THREE.BufferAttribute(w1, 4));
+                geometry.setAttribute('a_projWeight2', new THREE.BufferAttribute(w2, 4));
+                geometry.setAttribute('a_projWeight3', new THREE.BufferAttribute(w3, 4));
+                geometry.setAttribute('a_projWeight4', new THREE.BufferAttribute(w4, 3));
+
                 // Shader Material configuration
-                // We use transparency, disable depthWrite to prevent clipping artifacts, and add DoubleSide rendering.
+                // Solid Head, depthWrite: true, opaque rendering.
                 res.phantomHeadShaderMaterial = new THREE.ShaderMaterial({
                     uniforms: {
                         u_activeColormap: { value: 0 },
                         u_activeMode: { value: 0 },
                         u_faceColor: { value: new THREE.Color(0xdddddd) },
-                        u_opacity: { value: headmodelOpacity },
-                        u_heatmapOpacity: { value: heatmapOpacity },
                         u_mainLightDir: { value: new THREE.Vector3() },
                         u_rimLightDir: { value: new THREE.Vector3() },
-                        u_cameraPos: { value: new THREE.Vector3() }
+                        u_cameraPos: { value: new THREE.Vector3() },
+                        u_channelValues: { value: new Float32Array(19) },
+                        u_minVal: { value: 0.0 },
+                        u_maxVal: { value: 1.0 }
                     },
-                    transparent: true,
-                    depthWrite: false,
+                    transparent: false,
+                    depthWrite: true,
                     side: THREE.DoubleSide,
                     vertexShader: `
                         varying vec3 v_WorldNormal; varying vec3 v_WorldPosition; varying vec3 v_ModelPosition;
                         varying float v_interpolatedScalar; varying vec3 v_Color; varying float v_paintable;
-                        attribute float a_interpolatedScalar; attribute float a_paintable; attribute vec3 color;
+                        
+                        uniform float u_channelValues[19];
+                        uniform float u_minVal;
+                        uniform float u_maxVal;
+                        
+                        attribute vec4 a_projWeight0;
+                        attribute vec4 a_projWeight1;
+                        attribute vec4 a_projWeight2;
+                        attribute vec4 a_projWeight3;
+                        attribute vec3 a_projWeight4;
+                        attribute float a_paintable;
+                        attribute vec3 color;
+                        
                         void main() {
                             v_WorldNormal = normalize(vec3(modelMatrix * vec4(normal, 0.0)));
                             v_WorldPosition = vec3(modelMatrix * vec4(position, 1.0));
                             v_ModelPosition = position;
-                            v_interpolatedScalar = a_interpolatedScalar;
+                            
+                            // Perrin matrix row weight GPU projection
+                            float rawVal = 
+                                a_projWeight0.x * u_channelValues[0] +
+                                a_projWeight0.y * u_channelValues[1] +
+                                a_projWeight0.z * u_channelValues[2] +
+                                a_projWeight0.w * u_channelValues[3] +
+                                
+                                a_projWeight1.x * u_channelValues[4] +
+                                a_projWeight1.y * u_channelValues[5] +
+                                a_projWeight1.z * u_channelValues[6] +
+                                a_projWeight1.w * u_channelValues[7] +
+                                
+                                a_projWeight2.x * u_channelValues[8] +
+                                a_projWeight2.y * u_channelValues[9] +
+                                a_projWeight2.z * u_channelValues[10] +
+                                a_projWeight2.w * u_channelValues[11] +
+                                
+                                a_projWeight3.x * u_channelValues[12] +
+                                a_projWeight3.y * u_channelValues[13] +
+                                a_projWeight3.z * u_channelValues[14] +
+                                a_projWeight3.w * u_channelValues[15] +
+                                
+                                a_projWeight4.x * u_channelValues[16] +
+                                a_projWeight4.y * u_channelValues[17] +
+                                a_projWeight4.z * u_channelValues[18];
+                                
+                            v_interpolatedScalar = clamp((rawVal - u_minVal) / max(0.0001, u_maxVal - u_minVal), 0.0, 1.0);
                             v_Color = color;
                             v_paintable = a_paintable;
                             gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
                         }
                     `,
                     fragmentShader: `
+                        precision highp float;
                         varying vec3 v_WorldNormal; varying vec3 v_WorldPosition; varying vec3 v_ModelPosition;
                         varying float v_interpolatedScalar; varying vec3 v_Color; varying float v_paintable;
                         uniform vec3 u_mainLightDir; uniform vec3 u_rimLightDir; uniform vec3 u_cameraPos;
                         uniform vec3 u_faceColor; uniform int u_activeColormap; uniform int u_activeMode;
-                        uniform float u_opacity; uniform float u_heatmapOpacity;
                         
                         vec3 getSpectralColor(float v) {
                             float r = clamp(4.0*v-1.5,0.0,1.0);
@@ -541,18 +617,17 @@ const VisualizerView = ({ selectedPatient, selectedFile, token, onBack }) => {
                                 ? getSpectralColor(clamp(v_interpolatedScalar, 0.0, 1.0))
                                 : v_Color;
                             
-                            // Incorporate u_heatmapOpacity to control the heatmap alpha blending
-                            float paintBlend = smoothstep(0.05, 0.35, v_paintable) * u_heatmapOpacity;
-                            vec3 targetColor = mix(u_faceColor, heatColor, paintBlend);
+                            // Solid Heatmap Logic: if v_paintable > 0.5, solid heatColor, otherwise u_faceColor
+                            vec3 targetColor = (v_paintable > 0.5) ? heatColor : u_faceColor;
 
                             // Smoothly fade out down the neck base
                             float neckFadeFactor = smoothstep(-120.0, -25.0, v_ModelPosition.y);
                             targetColor = mix(u_faceColor, targetColor, neckFadeFactor);
 
-                            // FINAL COMPOSITE: color mapping with diffuse light shadow
+                            // FINAL COMPOSITE: solid color mapping with diffuse shadow
                             vec3 composite = targetColor * (0.5 + 0.5 * diff1);
                             
-                            gl_FragColor = vec4(composite, u_opacity); 
+                            gl_FragColor = vec4(composite, 1.0); 
                         }
                     `
                 });
@@ -560,14 +635,19 @@ const VisualizerView = ({ selectedPatient, selectedFile, token, onBack }) => {
                 res.headMesh = new THREE.Mesh(geometry, res.phantomHeadShaderMaterial);
                 res.scene.add(res.headMesh);
 
-                // Render plain dot markers for electrodes
+                // Render slightly offset glossy dot markers for electrodes to prevent clipping
                 res.electrodeMeshes = [];
                 cfg.electrodes.coords.forEach((coord, idx) => {
                     const sphere = new THREE.Mesh(
-                        new THREE.SphereGeometry(0.8, 8, 8),
-                        new THREE.MeshBasicMaterial({ color: 0x000000 })
+                        new THREE.SphereGeometry(0.9, 16, 16),
+                        new THREE.MeshStandardMaterial({ 
+                            color: 0x111111, 
+                            roughness: 0.7, 
+                            metalness: 0.1 
+                        })
                     );
-                    sphere.position.set(coord[0], coord[1], coord[2]);
+                    const scale = 1.03;
+                    sphere.position.set(coord[0] * scale, coord[1] * scale, coord[2] * scale);
                     sphere.userData = { index: idx, name: cfg.electrodes.names[idx] };
                     res.scene.add(sphere);
                     res.electrodeMeshes.push(sphere);
@@ -1035,27 +1115,20 @@ const VisualizerView = ({ selectedPatient, selectedFile, token, onBack }) => {
             if (!series) return;
 
             const s1 = s_idx, s2 = Math.min(s_idx + 1, series.length - 1);
-            if (s1 !== res.cached_s1 || s2 !== res.cached_s2 || loop.activeBand !== res.cached_band || loop.activeMode !== res.cached_mode) {
-                projectChannelsToVertices(series[s1], res.U_vertex_s1);
-                projectChannelsToVertices(series[s2], res.U_vertex_s2);
-                res.cached_s1 = s1; res.cached_s2 = s2;
-                res.cached_band = loop.activeBand; res.cached_mode = loop.activeMode;
-            }
-
-            smoothVertexField(res.U_vertex_s1, res.U_vertex_s2, alpha, res.U_smoothed);
-            
-            const lims = res.bandMinMax[loop.activeBand];
-            const scalarAttr = res.headMesh.geometry.getAttribute('a_interpolatedScalar');
-            for (let j = 0; j < res.vertexCount; j++) {
-                if (res.paintableMask[j] < 0.5) { scalarAttr.setX(j, 0.0); continue; }
-                scalarAttr.setX(j, Math.max(0.0, Math.min(1.0, (res.U_smoothed[j] - lims.min) / (lims.max - lims.min || 1.0))));
-            }
-            scalarAttr.needsUpdate = true;
 
             const curVals = new Float32Array(res.channelCount);
             for (let c = 0; c < res.channelCount; c++) {
                 curVals[c] = (1.0 - alpha) * series[s1][c] + alpha * series[s2][c];
             }
+
+            // Pass live 19-channel values to uniform float array
+            res.phantomHeadShaderMaterial.uniforms.u_channelValues.value = curVals;
+
+            // Pass min/max limits for GPU normalization
+            const lims = res.bandMinMax[loop.activeBand];
+            res.phantomHeadShaderMaterial.uniforms.u_minVal.value = lims.min;
+            res.phantomHeadShaderMaterial.uniforms.u_maxVal.value = lims.max;
+
             draw2DTopoplot(curVals, lims.min, lims.max, loop.activeColormap);
 
             // Compute dynamic sidebar power percentages
@@ -1179,7 +1252,7 @@ const VisualizerView = ({ selectedPatient, selectedFile, token, onBack }) => {
 
         if (res.hoveredElectrode) {
             res.hoveredElectrode.scale.set(1.0, 1.0, 1.0);
-            if (res.hoveredElectrode.material) res.hoveredElectrode.material.color.setHex(0x000000);
+            if (res.hoveredElectrode.material) res.hoveredElectrode.material.color.setHex(0x111111);
             res.hoveredElectrode = null;
         }
 
