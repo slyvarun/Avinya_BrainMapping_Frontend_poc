@@ -1,0 +1,19 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Build outputs
+dist/
+dist-ssr/
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
+
+# Log files
+*.log
+npm-debug.log*
+
+# Local env files
+.env*.local
